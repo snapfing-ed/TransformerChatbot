@@ -1,77 +1,81 @@
 import os
+import re
 import json
-import fitz # PyMuPDF
-from config.settings import BOOKS_DIR, DATA_DIR, GROUP_ID, SUBJECT, CHUNK_OVERLAP, CHUNK_SIZE
+import pymupdf as fitz  # PyMuPDF (new import name; keeps the fitz alias used below)
+from config.settings import (
+    BOOKS_DIR, DATA_DIR, MANIFEST_PATH, GROUP_ID, SUBJECT, CHUNK_SIZE, CHUNK_OVERLAP,
+)
+
+MIN_CHARS_PER_PAGE = 50   # pages with less text are flagged (likely scanned/blank)
+MIN_CHUNK_WORDS = 40      # drops tiny fragments (mostly overlap tails and stray captions)
+MAX_FIGURE_REFS = 3       # drops list-of-figures / caption-heavy chunks
+
+
+def chunk_words(words, size, overlap):
+    step = size - overlap
+    for i in range(0, len(words), step):
+        piece = words[i:i + size]
+        if piece:
+            yield i // step, " ".join(piece)
+
+
+def is_junk(chunk_text):
+    if len(chunk_text.split()) < MIN_CHUNK_WORDS:
+        return True
+    return len(re.findall(r"Figure \d", chunk_text)) >= MAX_FIGURE_REFS
+
 
 def extract_and_chunk_books():
-    passages = []
-    
-    # If no real PDFs are in books folder yet, generate dummy structured mock passages for robust testing
-    if not os.path.exists(BOOKS_DIR) or not os.listdir(BOOKS_DIR):
-        print("No PDFs found in /books. Generating robust stub corpus for demonstration and compliance...")
-        mock_passages = [
-            {
-                "group_id": GROUP_ID,
-                "subject": SUBJECT,
-                "book_id": "G014_BOOK_001",
-                "title": "Computer Networking Principles",
-                "edition": "7th edition",
-                "page": 12,
-                "chunk_id": "G014_BOOK_001_P12_C01",
-                "text": "A computer network is a set of devices connected through links. Nodes can be computers, routers, or other devices capable of sending and receiving data."
-            },
-            {
-                "group_id": GROUP_ID,
-                "subject": SUBJECT,
-                "book_id": "G014_BOOK_002",
-                "title": "Operating System Concepts",
-                "edition": "10th edition",
-                "page": 45,
-                "chunk_id": "G014_BOOK_002_P45_C01",
-                "text": "An operating system acts as an intermediary between a user of a computer and the computer hardware, managing CPU scheduling, memory, and storage."
-            }
-        ]
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(os.path.join(DATA_DIR, "passages.json"), "w", encoding="utf-8") as f:
-            json.dump(mock_passages, f, indent=2)
-        return mock_passages
+    """Build passages.json from the manifest. Every passage carries real manifest metadata.
 
-    # for exisitng real PDFs, process them page by page
-    for filename in os.listdir(BOOKS_DIR):
-        if filename.endswith(".pdf"):
-            pdf_path = os.path.join(BOOKS_DIR, filename)
-            doc = fitz.open(pdf_path)
-            book_id = f"{GROUP_ID}_" + filename.replace(".pdf", "").upper()
-            
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                text = page.get_text()
-                if not text.strip():
+    Each manifest entry needs a "filename" field naming its PDF in the books/ folder.
+    """
+    with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    passages, report = [], {"books": [], "total_passages": 0}
+
+    for book in manifest:
+        entry = {"book_id": book["book_id"], "title": book["title"],
+                 "pages": 0, "failed_pages": [], "dropped_chunks": 0, "status": "processed"}
+        pdf_path = os.path.join(BOOKS_DIR, book.get("filename", ""))
+        if not book.get("filename") or not os.path.exists(pdf_path):
+            entry["status"] = "missing_pdf"
+            report["books"].append(entry)
+            continue
+
+        doc = fitz.open(pdf_path)
+        entry["pages"] = len(doc)
+        for page_idx in range(len(doc)):
+            text = doc[page_idx].get_text().strip()
+            if len(text) < MIN_CHARS_PER_PAGE:
+                entry["failed_pages"].append(page_idx + 1)
+                continue
+            for c, chunk_text in chunk_words(text.split(), CHUNK_SIZE, CHUNK_OVERLAP):
+                if is_junk(chunk_text):
+                    entry["dropped_chunks"] += 1
                     continue
-                
-                # Simple sliding window chunker
-                words = text.split()
-                for i in range(0, len(words), CHUNK_SIZE - CHUNK_OVERLAP):
-                    chunk_words = words[i:i + CHUNK_SIZE]
-                    chunk_text = " ".join(chunk_words)
-                    chunk_id = f"{book_id}_P{page_num+1}_C{i//(CHUNK_SIZE - CHUNK_OVERLAP)}"
-                    
-                    passages.append({
-                        "group_id": GROUP_ID,
-                        "subject": SUBJECT,
-                        "book_id": book_id,
-                        "title": filename.replace(".pdf", ""),
-                        "edition": "1st edition",
-                        "page": page_num + 1,
-                        "chunk_id": chunk_id,
-                        "text": chunk_text
-                    })
+                passages.append({
+                    "group_id": GROUP_ID,
+                    "subject": SUBJECT,
+                    "book_id": book["book_id"],
+                    "title": book["title"],
+                    "edition": book["edition"],
+                    "page": page_idx + 1,  # PDF page index, not necessarily the printed page number
+                    "chunk_id": f"{book['book_id']}_P{page_idx + 1}_C{c:02d}",
+                    "text": chunk_text,
+                })
+        report["books"].append(entry)
 
+    report["total_passages"] = len(passages)
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(os.path.join(DATA_DIR, "passages.json"), "w", encoding="utf-8") as f:
         json.dump(passages, f, indent=2)
+    with open(os.path.join(DATA_DIR, "ingestion_report.json"), "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
     return passages
 
+
 if __name__ == "__main__":
-    extract_and_chunk_books()
-    print("Ingestion complete!")
+    p = extract_and_chunk_books()
+    print(f"Ingestion complete: {len(p)} passages. See data/ingestion_report.json")

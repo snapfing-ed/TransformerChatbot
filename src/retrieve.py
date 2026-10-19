@@ -1,46 +1,59 @@
 import os
 import json
 import numpy as np
-from sentence_transformers import SentenceTransformer
 import faiss
-from config.settings import DATA_DIR, EMBEDDING_MODEL, TOP_K
+from sentence_transformers import SentenceTransformer
+from config.settings import DATA_DIR, EMBEDDING_MODEL, EMBEDDING_REVISION, TOP_K
+
+PASSAGES_PATH = os.path.join(DATA_DIR, "passages.json")
+INDEX_PATH = os.path.join(DATA_DIR, "index.faiss")
+INDEX_META_PATH = os.path.join(DATA_DIR, "index_meta.json")
+
 
 class Retriever:
     def __init__(self):
-        passages_path = os.path.join(DATA_DIR, "passages.json")
-        if not os.path.exists(passages_path):
+        if not os.path.exists(PASSAGES_PATH):
             from src.ingest import extract_and_chunk_books
             extract_and_chunk_books()
-            
-        with open(passages_path, "r", encoding="utf-8") as f:
+        with open(PASSAGES_PATH, "r", encoding="utf-8") as f:
             self.passages = json.load(f)
-            
-        self.model = SentenceTransformer(EMBEDDING_MODEL)
+
+        self.model = SentenceTransformer(EMBEDDING_MODEL, revision=EMBEDDING_REVISION)
+        meta = {"model": EMBEDDING_MODEL, "revision": EMBEDDING_REVISION,
+                "n_passages": len(self.passages), "metric": "cosine (normalized inner product)"}
+
+        if os.path.exists(INDEX_PATH) and os.path.exists(INDEX_META_PATH):
+            with open(INDEX_META_PATH, "r", encoding="utf-8") as f:
+                if json.load(f) == meta:
+                    self.index = faiss.read_index(INDEX_PATH)
+                    return
+
+        print("Building index (one-time)...")
         texts = [p["text"] for p in self.passages]
-        
-        print("Embedding passages for vector search...")
-        embeddings = self.model.encode(texts, show_progress_bar=False)
-        embeddings = np.array(embeddings).astype("float32")
-        
-        dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatL2(dimension)
-        self.index.add(embeddings)
+        emb = self.model.encode(texts, batch_size=64, show_progress_bar=True,
+                                normalize_embeddings=True).astype("float32")
+        self.index = faiss.IndexFlatIP(emb.shape[1])
+        self.index.add(emb)
+        faiss.write_index(self.index, INDEX_PATH)
+        with open(INDEX_META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
 
     def retrieve(self, question: str, top_k: int = TOP_K) -> list:
         """Return passages with text, score, book_id, title, page, and chunk_id."""
-        query_vector = self.model.encode([question]).astype("float32")
-        distances, indices = self.index.search(query_vector, min(top_k, len(self.passages)))
-        
+        q = self.model.encode([question], normalize_embeddings=True).astype("float32")
+        scores, idxs = self.index.search(q, min(top_k, len(self.passages)))
         results = []
-        for dist, idx in zip(distances[0], indices[0]):
-            if idx < len(self.passages):
-                p = self.passages[idx].copy()
-                p["score"] = float(1.0 / (1.0 + dist))  # Convert L2 distance to similarity score
-                results.append(p)
+        for score, idx in zip(scores[0], idxs[0]):
+            if idx < 0:
+                continue
+            p = self.passages[idx].copy()
+            p["score"] = float(score)  # cosine similarity in [-1, 1]
+            results.append(p)
         return results
 
-# Global retriever instance
+
 _retriever = None
+
 
 def get_retriever():
     global _retriever
@@ -48,6 +61,6 @@ def get_retriever():
         _retriever = Retriever()
     return _retriever
 
+
 def retrieve(question: str, top_k: int = TOP_K) -> list:
-    retriever = get_retriever()
-    return retriever.retrieve(question, top_k)
+    return get_retriever().retrieve(question, top_k)
